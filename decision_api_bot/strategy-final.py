@@ -98,6 +98,16 @@ import os, sys, json, time, random, logging, threading, html, io, traceback
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 import requests
+def _load_dotenv():
+    """Load KEY=VALUE lines from .env next to this script (does not override real env vars)."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")) as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and "=" in ln:
+                    k, v = ln.split("=", 1); os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError: pass
+_load_dotenv()
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or ""   # prefer env (.env, chmod 600)
@@ -227,36 +237,108 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 DECISION_API_KEY = os.environ.get("DECISION_API_KEY") or ""
 DECISION_URL = "https://generativelanguage.googleapis.com/v1beta/decisions"
 DECISION_MODEL = "gemini-decision-1"
-DECISION_CANDLES = 60            # last N 1m candles sent as market context
+DECISION_CANDLES = 180           # 1m candles used for indicators (bot's own + backfill)
 DECISION_RETRY_SEC = 20          # API failure -> wait this long, then ask again (signal is never randomised / skipped)
-DECISION_INSTR = ("You are a professional XAUUSD (gold) scalper. Using the price data, decide the direction of the NEXT "
-                  "scalping trade (target ~$5 / stop ~$6.5 per 0.01 lot, i.e. ~50 / ~65 pips, usually closes within "
-                  "30-90 minutes). Pick the side with the higher probability of hitting its target first.")
+DECISION_INSTR = ("You are an expert XAUUSD (gold) 1-minute scalper. Trades last only 2-10 minutes. Using the indicators "
+                  "and the most recent 1m candles (short-term momentum, EMA9/EMA21 cross, RSI, candle bodies/wicks, "
+                  "breakout or rejection of the recent high/low), decide which side is more likely to reach its take "
+                  "profit before its stop loss within the next 2-10 minutes. Focus on the last 5-15 minutes; the higher "
+                  "timeframes are only context.")
 DECISION_STATS = {"calls": 0, "ok": 0, "fail": 0, "last_err": "—", "last": None, "log": []}
+BACKFILL_URL = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"
+_BACKFILL = {"t": 0, "rows": []}
 
-def decision_input(rows, bid, ask, session, now_utc=None):
-    now_utc = now_utc or datetime.now(timezone.utc)
-    L = [f"Symbol: XAUUSD (spot gold). Time: {now_utc:%Y-%m-%d %H:%M} UTC. Session: {session}.",
-         f"Live quote: bid {bid:.3f} / ask {ask:.3f}."]
-    if rows:
-        c = [r[4] for r in rows]
-        L.append(f"Last {len(rows)} x 1-minute candles: range high {max(r[2] for r in rows):.2f} low {min(r[3] for r in rows):.2f}; "
-                 f"change over window {c[-1] - rows[0][1]:+.2f}; last 5 min {c[-1] - c[max(0, len(c) - 6)]:+.2f}; "
-                 f"last 15 min {c[-1] - c[max(0, len(c) - 16)]:+.2f}.")
-        L.append("Candles oldest->newest (time UTC, open, high, low, close):")
-        for r in rows:
-            L.append(f"{datetime.fromtimestamp(r[0], timezone.utc):%H:%M} {r[1]:.2f} {r[2]:.2f} {r[3]:.2f} {r[4]:.2f}")
+def backfill_rows():
+    """COMEX gold 1m candles (Yahoo, ~10 min delayed), cached 60 s. Only used where the bot has no own candles."""
+    if time.time() - _BACKFILL["t"] < 60: return _BACKFILL["rows"]
+    _BACKFILL["t"] = time.time()
+    try:
+        d = requests.get(BACKFILL_URL, timeout=8, headers={"User-Agent": "Mozilla/5.0"}).json()["chart"]["result"][0]
+        q = d["indicators"]["quote"][0]; out = []
+        for k, ts in enumerate(d["timestamp"]):
+            o, h, l, c = q["open"][k], q["high"][k], q["low"][k], q["close"][k]
+            if None not in (o, h, l, c): out.append((float(ts // 60 * 60), o, h, l, c))
+        _BACKFILL["rows"] = out
+    except Exception as e:
+        log.warning("backfill failed: %s", str(e)[:120])
+    return _BACKFILL["rows"]
+
+def merged_rows(own, n=DECISION_CANDLES):
+    """Own fresh 1m candles; the older gap is filled from backfill shifted to our price level (offset at the join)."""
+    own = [tuple(r) for r in (own or []) if time.time() - r[0] < 3 * 3600]
+    if len(own) >= n: return own[-n:]
+    bf = backfill_rows()
+    if not bf: return own
+    if own:
+        t0 = own[0][0]; prev = [r for r in bf if r[0] < t0]
+        if not prev: return own
+        off = own[0][1] - prev[-1][4]
     else:
-        L.append("No candle history available yet.")
+        prev = bf; off = 0.0
+        if time.time() - prev[-1][0] > 3 * 3600: return own
+    prev = [(r[0], r[1] + off, r[2] + off, r[3] + off, r[4] + off) for r in prev]
+    return (prev + own)[-n:]
+
+def _ema(v, n):
+    k = 2 / (n + 1); e = v[0]
+    for x in v[1:]: e = x * k + e * (1 - k)
+    return e
+
+def _rsi(v, n=14):
+    if len(v) <= n: return 50.0
+    g = [max(0, v[i] - v[i - 1]) for i in range(len(v) - n, len(v))]
+    l_ = [max(0, v[i - 1] - v[i]) for i in range(len(v) - n, len(v))]
+    ag, al = sum(g) / n, sum(l_) / n
+    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+def _agg(rows, m):
+    out = {}
+    for r in rows:
+        k = int(r[0] // (m * 60))
+        if k not in out: out[k] = [r[0], r[1], r[2], r[3], r[4]]
+        else: o = out[k]; o[2] = max(o[2], r[2]); o[3] = min(o[3], r[3]); o[4] = r[4]
+    return [tuple(x) for x in out.values()]
+
+def decision_input(rows, bid, ask, session, now_utc=None, tp=5.0, sl=6.5):
+    now_utc = now_utc or datetime.now(timezone.utc); mid = (bid + ask) / 2
+    L = [f"Symbol: XAUUSD spot gold. Time {now_utc:%Y-%m-%d %H:%M} UTC, session {session}.",
+         f"Live bid {bid:.2f} / ask {ask:.2f}. Trade plan: TP about ${tp:.1f} price move, SL about ${sl:.1f}, horizon 2-10 minutes."]
+    if len(rows) < 5:
+        L.append("Very little candle history available."); return "\n".join(L)
+    c = [r[4] for r in rows] + [mid]
+    tr = [max(r[2], rows[i - 1][4]) - min(r[3], rows[i - 1][4]) for i, r in enumerate(rows) if i]
+    atr = sum(tr[-14:]) / max(1, len(tr[-14:]))
+    e9, e21, e50 = _ema(c, 9), _ema(c, 21), _ema(c, 50)
+    e9p = _ema(c[:-3], 9) if len(c) > 12 else e9
+    hi15, lo15 = max(r[2] for r in rows[-15:]), min(r[3] for r in rows[-15:])
+    hi60, lo60 = max(r[2] for r in rows[-60:]), min(r[3] for r in rows[-60:])
+    ch = lambda n: mid - c[max(0, len(c) - 1 - n)]
+    L += ["INDICATORS (1m):",
+          f"Change: last 1m {ch(1):+.2f}, 3m {ch(3):+.2f}, 5m {ch(5):+.2f}, 10m {ch(10):+.2f}, 15m {ch(15):+.2f}, 30m {ch(30):+.2f}, 60m {ch(60):+.2f}.",
+          f"EMA9 {e9:.2f} ({'rising' if e9 > e9p else 'falling'}), EMA21 {e21:.2f}, EMA50 {e50:.2f}; price is "
+          f"{'ABOVE' if mid > e9 else 'BELOW'} EMA9 and {'ABOVE' if mid > e21 else 'BELOW'} EMA21; EMA9 {'>' if e9 > e21 else '<'} EMA21.",
+          f"RSI14 1m: {_rsi(c):.1f}. ATR14 1m: {atr:.2f}.",
+          f"Last 15m range {lo15:.2f}-{hi15:.2f} (price at {(mid - lo15) / max(0.01, hi15 - lo15) * 100:.0f}% of range); "
+          f"last 60m range {lo60:.2f}-{hi60:.2f} (at {(mid - lo60) / max(0.01, hi60 - lo60) * 100:.0f}%).",
+          f"Distance to 15m high {hi15 - mid:+.2f}, to 15m low {lo15 - mid:+.2f}."]
+    for m in (5, 15):
+        a = _agg(rows, m)[-6:]
+        if len(a) >= 2:
+            L.append(f"{m}m candles (open/high/low/close) oldest->newest: " + "; ".join(f"{x[1]:.2f}/{x[2]:.2f}/{x[3]:.2f}/{x[4]:.2f}" for x in a))
+    L.append("Last 15 x 1m candles oldest->newest (time UTC open high low close | body, upper wick, lower wick):")
+    for r in rows[-15:]:
+        o, h, l_, cl = r[1], r[2], r[3], r[4]
+        L.append(f"{datetime.fromtimestamp(r[0], timezone.utc):%H:%M} {o:.2f} {h:.2f} {l_:.2f} {cl:.2f} | "
+                 f"{cl - o:+.2f}, {h - max(o, cl):.2f}, {min(o, cl) - l_:.2f}")
     return "\n".join(L)
 
-def decide_direction(rows, bid, ask, session, timeout=20):
+def decide_direction(rows, bid, ask, session, timeout=20, tp=5.0, sl=6.5):
     """Ask the Decisions API: BUY or SELL. Returns (dir, info) or raises. No random fallback."""
-    rows = [r for r in (rows or []) if time.time() - r[0] < 3 * 3600]   # only fresh candles (ignore stale history)
-    body = {"model": DECISION_MODEL, "input": decision_input(rows, bid, ask, session),
+    rows = merged_rows(rows)
+    body = {"model": DECISION_MODEL, "input": decision_input(rows, bid, ask, session, tp=tp, sl=sl),
             "questions": {"direction": {"type": "choice", "instructions": DECISION_INSTR,
-                                        "criteria": {"buy": "Go LONG: price is more likely to rise ~$5 before falling ~$6.5.",
-                                                     "sell": "Go SHORT: price is more likely to fall ~$5 before rising ~$6.5."}}}}
+                                        "criteria": {"buy": f"BUY now: price likely rises ${tp:.1f} before it falls ${sl:.1f} in the next 2-10 minutes.",
+                                                     "sell": f"SELL now: price likely falls ${tp:.1f} before it rises ${sl:.1f} in the next 2-10 minutes."}}}}
     DECISION_STATS["calls"] += 1
     try:
         r = requests.post(DECISION_URL, json=body, timeout=timeout,
@@ -1892,6 +1974,10 @@ class Bot:
         if ss.get("date") != today: ss["date"], ss["rows"] = today, {}
         return ss["rows"].setdefault(name, {"signals": 0, "tp": 0, "sl": 0, "pips": 0.0, "money": 0.0})
 
+    def dec_levels(self):
+        tr = tuple(self.st.s.get("tp_range") or TP_RANGE); sr = tuple(self.st.s.get("sl_range") or SL_RANGE)
+        return dict(tp=sum(tr) / 2 * PIP, sl=sum(sr) / 2 * PIP)
+
     def ai_decide(self):
         """Decisions API call OUTSIDE the state lock. Returns (dir, info) or (None, None) on failure (retry later)."""
         self._dec_wait = False
@@ -1900,7 +1986,7 @@ class Bot:
         if not q: return None, None
         try:
             ss_ = session_at(datetime.now(timezone.utc))
-            d, info = decide_direction(self.candles.get(DECISION_CANDLES), q[0], q[1], ss_[0] if ss_ else "OUTSIDE")
+            d, info = decide_direction(self.candles.get(DECISION_CANDLES), q[0], q[1], ss_[0] if ss_ else "OUTSIDE", **self.dec_levels())
             log.info("DECISION %s conf=%.3f buy=%.3f sell=%.3f", d, info["conf"], info["buy"], info["sell"]); return d, info
         except Exception as e:
             self._dec_wait = True; self._dec_retry_at = time.time() + DECISION_RETRY_SEC
@@ -3726,9 +3812,10 @@ class Bot:
             else:
                 try:
                     ss_ = session_at(datetime.now(timezone.utc))
-                    d, i = decide_direction(self.candles.get(DECISION_CANDLES), q[0], q[1], ss_[0] if ss_ else "OUTSIDE")
+                    d, i = decide_direction(self.candles.get(DECISION_CANDLES), q[0], q[1], ss_[0] if ss_ else "OUTSIDE", **self.dec_levels())
                     L += ["", f"🧪 <b>Test now:</b> {'🟢' if d == 'BUY' else '🔴'} <b>{d}</b> · confidence <b>{i['conf'] * 100:.1f}%</b>",
                           f"📊 BUY {i['buy'] * 100:.1f}% · SELL {i['sell'] * 100:.1f}% · bid <code>{fmt_p(q[0])}</code>",
+                          f"🕯 Data: {len(merged_rows(self.candles.get(DECISION_CANDLES)))} x 1m candles · horizon 2-10 min",
                           "<i>(test only — no trade opened)</i>"]
                 except Exception as e: L += ["", f"🧪 <b>Test:</b> ❌ <code>{html.escape(str(e)[:200])}</code>"]
         res = {h.get("id"): h for h in (s.get("history") or [])}

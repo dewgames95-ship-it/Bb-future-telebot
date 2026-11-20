@@ -1,0 +1,22 @@
+[Unit]
+Description=XAUUSD Decision API signal bot (@Decision1apibot)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/xau_decision_bot
+EnvironmentFile=/opt/xau_decision_bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=MPLCONFIGDIR=/opt/xau_decision_bot/.mplcache
+ExecStart=/opt/xau_decision_bot/.venv/bin/python /opt/xau_decision_bot/strategy-final.py
+Restart=always
+RestartSec=5
+MemoryMax=700M
+Nice=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

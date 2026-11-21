@@ -1451,7 +1451,9 @@ def menu_ikb(chart_on=True, chart_tf=CHART_TF_DEFAULT):
         [_b("♻️ Reset", "reset"), _b("ℹ️ Guide", "guide")], [_b("🩺 Health", "health"), _b("🔄 Refresh", "dash")]]
         + ([[_b(f"📢 {c['key']}", f"c:{c['key']}:view") for c in CHANNELS]] if CHANNELS else [])
         + [[_b("🧠 Decision API", "dec")], [_b("💎 Channel view", "c:SRC:view"), _b("📈 Streaks", "stk:alltime")]]}
-DEC_IKB = {"inline_keyboard": [[_b("🧪 Test decision now", "dec:test")], [_b("🔄 Refresh", "dec"), _b("⬅️ Back", "back")]]}
+DEC_IKB = {"inline_keyboard": [[_b("🧪 Test decision now", "dec:test")], [_b("⚖️ AI vs Random (live)", "dec:cmp")],
+                             [_b("🔄 Refresh", "dec"), _b("⬅️ Back", "back")]]}
+CMP_IKB = {"inline_keyboard": [[_b("🔄 Refresh", "dec:cmp"), _b("⬅️ Back", "dec")]]}
 def tf_ikb(chart_tf=CHART_TF_DEFAULT, key=None):
     """Legacy 1m/5m/15m picker (also reused inside per-channel chart settings)."""
     cur = normalize_chart_tf(chart_tf)
@@ -1974,6 +1976,56 @@ class Bot:
         if ss.get("date") != today: ss["date"], ss["rows"] = today, {}
         return ss["rows"].setdefault(name, {"signals": 0, "tp": 0, "sl": 0, "pips": 0.0, "money": 0.0})
 
+    def shadow_loop(self):
+        """Live comparison: the OPPOSITE of every AI signal is tracked as a virtual trade (same TP/SL distances,
+        same quote, same spread). Random baseline = 50% AI result + 50% opposite result."""
+        while not self.stop.is_set():
+            try:
+                sh = self.st.s.get("shadows") or []
+                q = self.px.get(max_age=5) if sh else None
+                if q:
+                    done = []
+                    for v in list(sh):
+                        r = check_hit(v, *q); age = time.time() - v["opened"]
+                        if r or age > 10 * 3600:
+                            pips = v["tp_pips"] if r == "TP" else -v["sl_pips"] if r == "SL" else pips_between(v["direction"], v["entry"], close_price_for(v["direction"], *q))
+                            net = round(money_for_pips(pips, v["lot"]) - spread_cost(v["lot"]), 2)
+                            done.append((v, dict(id=v["id"], ai=v["ai"], opp_res=r or "TIME", opp_net=net, opp_min=round(age / 60, 1))))
+                    if done:
+                        with self.st.lock:
+                            for v, row in done:
+                                if v in self.st.s["shadows"]: self.st.s["shadows"].remove(v)
+                                c = self.st.s.setdefault("cmp", []); c.append(row); del c[:-2000]
+                            self.st.save()
+            except Exception: log.exception("shadow loop")
+            self.stop.wait(0.5)
+
+    def compare_text(self):
+        s = self.st.s; hist = {h["id"]: h for h in (s.get("history") or [])}
+        rows = [(c, hist[c["id"]]) for c in (s.get("cmp") or []) if c["id"] in hist and not hist[c["id"]].get("sys")]
+        L = ["⚖️ <b>LIVE: AI vs RANDOM</b>", SEP_,
+             "Every AI signal also runs a virtual OPPOSITE trade (same TP/SL, same spread).",
+             "Random = 50% AI side + 50% opposite side.", ""]
+        n = len(rows)
+        if not n:
+            L.append(f"⏳ No finished pairs yet · running: {len(s.get('shadows') or [])}"); return "\n".join(L)
+        aw = sum(1 for c, h in rows if is_win_trade(h)); ow = sum(1 for c, h in rows if c["opp_res"] == "TP")
+        an = sum(float(h.get("net") or 0) for c, h in rows); on = sum(c["opp_net"] for c, h in rows)
+        rw = (aw + ow) / 2; rn = (an + on) / 2
+        se = (0.25 / n) ** 0.5 * 100
+        L += [f"📊 <b>Trades compared:</b> {n}",
+              f"🧠 <b>AI:</b> {aw}/{n} TP · <b>{aw / n * 100:.1f}%</b> · net <b>${an:+,.2f}</b> (${an / n:+.2f}/trade)",
+              f"🎲 <b>Random:</b> {rw / n * 100:.1f}% · net <b>${rn:+,.2f}</b> (${rn / n:+.2f}/trade)",
+              f"🔁 <b>Opposite:</b> {ow}/{n} TP · {ow / n * 100:.1f}% · net ${on:+,.2f}",
+              f"📈 <b>AI edge vs random:</b> {(aw - rw) / n * 100:+.1f}% win · ${an - rn:+,.2f}",
+              f"📏 Noise at {n} trades: ±{2 * se:.1f}% (edge smaller than this = luck)",
+              f"⏳ Running virtual trades: {len(s.get('shadows') or [])}"]
+        L += ["", "📜 <b>Last 10</b>"]
+        for c, h in rows[-10:][::-1]:
+            L.append(f"#{c['id']} AI {c['ai']} {'✅' if is_win_trade(h) else '❌'} ${float(h.get('net') or 0):+.2f} · opp {'✅' if c['opp_res'] == 'TP' else '❌'} ${c['opp_net']:+.2f}")
+        L.append(f"\n🕒 {datetime.now(IST):%d %b %H:%M:%S} IST")
+        return "\n".join(L)
+
     def dec_levels(self):
         tr = tuple(self.st.s.get("tp_range") or TP_RANGE); sr = tuple(self.st.s.get("sl_range") or SL_RANGE)
         return dict(tp=sum(tr) / 2 * PIP, sl=sum(sr) / 2 * PIP)
@@ -2046,6 +2098,9 @@ class Bot:
             s["open"] = t; s["signals"] = s.get("signals", 0) + 1
             if ai_info:
                 dl = s.setdefault("dec_log", []); dl.append(dict(id=sid, d=d, conf=t["ai"]["conf"], ts=int(time.time()), res=None)); del dl[:-30]
+                od = "SELL" if d == "BUY" else "BUY"; oe = round(entry_price_for(od, bid, ask), 3); otp, osl = levels(od, oe, tpp, slp)
+                s.setdefault("shadows", []).append(dict(id=sid, ai=d, direction=od, entry=oe, tp=otp, sl=osl, tp_pips=tpp, sl_pips=slp,
+                                                        lot=lot, opened=time.time()))
             self.st.save()
         snap = dict(t)                     # immutable snapshot: text AND chart come from the same object
         ck_ = chart_key("sig", snap) + f"|{self.key}"
@@ -3773,6 +3828,8 @@ class Bot:
             if not self.st.s.get("armed"):
                 with self.st.lock: self.st.s["armed"] = True; self.st.s["armed_at"] = time.time(); self.st.save()
             reply(self.force_signal()); return
+        if txt in ("/compare", "/cmp"):
+            self.tg.send(cid, self.compare_text(), markup=CMP_IKB); return
         if txt in ("🧠 Decision API", "/decision", "/ai"):
             self.tg.send(cid, self.decision_text(), markup=DEC_IKB); return
         if txt in ("📂 Open Trades", "/open"):
@@ -3846,6 +3903,7 @@ class Bot:
             elif data == "stats": edit(self.stats_text(), STATS_IKB)
             elif data == "dec": edit(self.decision_text(), DEC_IKB)
             elif data == "dec:test": edit(self.decision_text(test=True), DEC_IKB)
+            elif data == "dec:cmp": edit(self.compare_text(), CMP_IKB)
             elif data == "open": edit(self.open_text(), OPEN_IKB)
             elif data == "sess": edit(self.sessions_text(), BACK_IKB)
             elif data == "help": edit(self.help_text(), BACK_IKB)
@@ -4016,7 +4074,7 @@ class Bot:
         try: self.check_chats()
         except Exception: log.exception("startup chat check")
         self.workers = {"price": (self.px.loop, (self.stop,)), "telegram": (self.poll_loop, ()),
-                        "engine": (self.trade_loop, ()), "scheduler": (self.scheduler_loop, ())}
+                        "engine": (self.trade_loop, ()), "scheduler": (self.scheduler_loop, ()), "shadow": (self.shadow_loop, ())}
         self.recover()
         self.threads, self.thmap, restarts = [], {}, []
         def start(name):

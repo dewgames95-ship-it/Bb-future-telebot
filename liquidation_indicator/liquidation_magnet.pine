@@ -46,10 +46,9 @@ mmPct    = input.float(0.40, "Maintenance margin %", step=0.1, group=g3)
 maxZones = input.int(400, "Zones kept in memory", maxval=1500, group=g3)
 showN    = input.int(30, "Zones drawn", maxval=150, group=g3)
 g4 = "Look"
-showZones = input.bool(true, "Show liquidation zones", group=g4)
-showPos   = input.bool(true, "Show trade boxes (target / stop)", group=g4)
-keepPos   = input.int(25, "Trade boxes kept", maxval=100, group=g4)
-showProj  = input.bool(true, "Show magnet projection", group=g4)
+showZones = input.bool(false, "Show liquidation zones (heatmap)", group=g4)
+showPos   = input.bool(true, "Show live trade (entry / target / stop)", group=g4)
+showProj  = input.bool(false, "Show magnet projection", group=g4)
 projBars  = input.int(25, "Projection length (bars)", group=g4)
 showTable = input.bool(true, "Show results table", group=g4)
 tblPos    = input.string("Top right", "Table position", options=["Top right", "Top left", "Bottom right", "Bottom left"], group=g4)
@@ -97,9 +96,6 @@ var float tTp = na
 var float tSl = na
 var int   tBar = na
 var float tPos = na
-var box   tBoxTp = na
-var box   tBoxSl = na
-var box[] oldBoxes = array.new_box()
 var int   nTrades = 0
 var int   nWins = 0
 var float grossWin = 0.0
@@ -139,15 +135,7 @@ if barstate.isconfirmed and not na(oi) and not na(oi[1])
                 grossLoss -= pnl
             peak := math.max(peak, equity)
             maxDD := math.max(maxDD, (peak - equity) / peak * 100)
-            if not na(tBoxTp)
-                box.set_right(tBoxTp, bar_index)
-                box.set_right(tBoxSl, bar_index)
-            label.new(bar_index, ex, hitTp ? "✅ " + pct(math.abs(ret) * 100) : "❌ -" + pct(math.abs(ret) * 100),
-                      style=label.style_none, textcolor=hitTp ? cBuy : cSell, size=size.small)
             tDir := 0
-    else if tDir != 0 and not na(tBoxTp)
-        box.set_right(tBoxTp, bar_index)
-        box.set_right(tBoxSl, bar_index)
 
     // 2) remove liquidated zones
     n = array.size(zPx)
@@ -219,7 +207,7 @@ if barstate.isconfirmed and not na(oi) and not na(oi[1])
         mine    = side == 1 ? upUsd : dnUsd
         other   = side == 1 ? dnUsd : upUsd
         tgtZ    = side == 1 ? upTgt : dnTgt
-        shortTxt = (side == 1 ? "BUY\n🧲 $" + fmtM(mine) + " shorts above" : "SELL\n🧲 $" + fmtM(mine) + " longs below")
+        shortTxt = side == 1 ? "BUY" : "SELL"
         reason = (side == 1 ? "🟢 BUY — Whale Magnet UP\n\n" : "🔴 SELL — Whale Magnet DOWN\n\n") +
                  "💰 $" + fmtM(mine) + (side == 1 ? " of SHORT traders get liquidated if price goes up " : " of LONG traders get liquidated if price goes down ") + pct(rngPct) + ".\n" +
                  "⚖️ Only $" + fmtM(other) + " on the other side (" + str.tostring(other > 0 ? mine / other : 99, "#.#") + "x less).\n" +
@@ -229,24 +217,37 @@ if barstate.isconfirmed and not na(oi) and not na(oi[1])
                  "❌ Stop " + str.tostring(tSl, format.mintick) + " (" + (side == 1 ? "-" : "+") + pct(slP) + ")\n" +
                  "📦 Size $" + str.tostring(tPos, "#,###") + " · leverage " + str.tostring(levX, "#.#") + "x · risk " + pct(riskPct) + " ($" + str.tostring(equity * riskPct / 100, "#.##") + ")"
         label.new(bar_index, side == 1 ? low : high, shortTxt, style=side == 1 ? label.style_label_up : label.style_label_down,
-                  color=side == 1 ? cBuy : cSell, textcolor=color.white, size=size.small, tooltip=reason)
-        if showPos
-            if not na(tBoxTp)
-                array.push(oldBoxes, tBoxTp)
-                array.push(oldBoxes, tBoxSl)
-            tBoxTp := box.new(bar_index, math.max(tEntry, tTp), bar_index + 1, math.min(tEntry, tTp), border_color=color.new(cBuy, 40),
-                              bgcolor=color.new(cBuy, 80), text="TARGET " + (side == 1 ? "+" : "-") + pct(tpP), text_color=color.new(color.white, 10),
-                              text_size=size.tiny, text_halign=text.align_left, text_valign=side == 1 ? text.align_top : text.align_bottom)
-            tBoxSl := box.new(bar_index, math.max(tEntry, tSl), bar_index + 1, math.min(tEntry, tSl), border_color=color.new(cSell, 40),
-                              bgcolor=color.new(cSell, 80), text="STOP " + (side == 1 ? "-" : "+") + pct(slP), text_color=color.new(color.white, 10),
-                              text_size=size.tiny, text_halign=text.align_left, text_valign=side == 1 ? text.align_bottom : text.align_top)
-            while array.size(oldBoxes) > keepPos * 2
-                box.delete(array.shift(oldBoxes))
+                  color=side == 1 ? cBuy : cSell, textcolor=color.white, size=size.normal, tooltip=reason)
 
 alertcondition(buySig,  "🐋 BUY",  "Whale Magnet BUY {{ticker}} {{interval}} @ {{close}}")
 alertcondition(sellSig, "🐋 SELL", "Whale Magnet SELL {{ticker}} {{interval}} @ {{close}}")
 
-// ───────── zones + projection (drawn on last bar only) ─────────
+// ───────── live trade: entry / target / stop (like a position tool), last bar only ─────────
+var box   lbTp = na
+var box   lbSl = na
+var line  llE = na
+var line  llTp = na
+var line  llSl = na
+var label lbE = na
+var label lbT = na
+var label lbS = na
+if barstate.islast
+    box.delete(lbTp), box.delete(lbSl), line.delete(llE), line.delete(llTp), line.delete(llSl)
+    label.delete(lbE), label.delete(lbT), label.delete(lbS)
+    if showPos and tDir != 0
+        x2  = bar_index + 25
+        tpP = math.abs(tTp - tEntry) / tEntry * 100
+        slP = math.abs(tSl - tEntry) / tEntry * 100
+        lbTp := box.new(tBar, math.max(tEntry, tTp), x2, math.min(tEntry, tTp), border_color=color.new(cBuy, 100), bgcolor=color.new(cBuy, 85))
+        lbSl := box.new(tBar, math.max(tEntry, tSl), x2, math.min(tEntry, tSl), border_color=color.new(cSell, 100), bgcolor=color.new(cSell, 85))
+        llE  := line.new(tBar, tEntry, x2, tEntry, color=color.new(color.gray, 0), width=2)
+        llTp := line.new(tBar, tTp, x2, tTp, color=cBuy, width=2, style=line.style_dashed)
+        llSl := line.new(tBar, tSl, x2, tSl, color=cSell, width=2)
+        lbE  := label.new(x2, tEntry, "Entry  " + str.tostring(tEntry, format.mintick), style=label.style_label_left, color=color.new(#131722, 0), textcolor=color.white, size=size.small)
+        lbT  := label.new(x2, tTp, "Target " + (tDir == 1 ? "+" : "-") + pct(tpP) + "  " + str.tostring(tTp, format.mintick), style=label.style_label_left, color=cBuy, textcolor=color.white, size=size.small)
+        lbS  := label.new(x2, tSl, "Stop " + (tDir == 1 ? "-" : "+") + pct(slP) + "  " + str.tostring(tSl, format.mintick), style=label.style_label_left, color=cSell, textcolor=color.white, size=size.small)
+
+// ───────── zones + projection (optional, off by default) ─────────
 var box[] zoneBoxes = array.new_box()
 var line  pLine = na
 var label pLab  = na

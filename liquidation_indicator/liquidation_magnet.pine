@@ -1,0 +1,165 @@
+// Liquidation Magnet [non-repaint]  —  estimated liquidation map from Open Interest
+// How it works (all on CLOSED bars only -> no repaint):
+//  1) Open Interest rises on a bar  -> new positions were opened near that bar's price (hlc3).
+//     Split long/short by candle body, spread over leverage tiers 10x/25x/50x/100x.
+//  2) Each position has a liquidation price:  long = p*(1-1/L+MM),  short = p*(1+1/L-MM).
+//     These are stored as zones: ORANGE = long liquidations (below price), CYAN = short liquidations (above).
+//  3) Price touching a zone = those positions got liquidated -> zone removed.  OI falling -> all zones shrink.
+//  4) MAGNET: more liquidation money within +/-range% on one side -> price tends to be pulled there.
+//     BUY  = short-liq money above  > ratio x long-liq money below.  SELL = the opposite.
+//  5) A faint dotted projection shows the path toward the magnet (a guide, NOT a prediction).
+// Data: TradingView "<EXCHANGE>:<TICKER>_OI" open interest (e.g. BINANCE:BTCUSDT.P_OI). Estimates only.
+//@version=5
+indicator("Liquidation Magnet [non-repaint]", shorttitle="LiqMagnet", overlay=true,
+     max_boxes_count=300, max_lines_count=50, max_labels_count=100)
+
+// ---------- inputs ----------
+oiSymIn   = input.string("", "Open Interest symbol (blank = auto <TICKER>_OI)")
+binPct    = input.float(0.10, "Zone size %", minval=0.02, step=0.02)
+mmPct     = input.float(0.40, "Maintenance margin %", step=0.1)
+w10       = input.float(30, "Weight 10x", inline="w")
+w25       = input.float(30, "25x", inline="w")
+w50       = input.float(25, "50x", inline="w")
+w100      = input.float(15, "100x", inline="w")
+rngPct    = input.float(2.0, "Magnet range %", step=0.5)
+ratio     = input.float(2.0, "Magnet imbalance ratio", minval=1.1, step=0.1)
+coolBars  = input.int(12, "Min bars between same-side signals")
+maxZones  = input.int(400, "Zones kept in memory", maxval=1500)
+showN     = input.int(40, "Zones drawn", maxval=250)
+zoneBack  = input.int(60, "Zone starts N bars back")
+projBars  = input.int(30, "Projection length (bars)")
+showProj  = input.bool(true, "Show projection")
+cLong     = input.color(color.rgb(255, 152, 0), "Long-liq colour")
+cShort    = input.color(color.rgb(0, 229, 255), "Short-liq colour")
+
+// ---------- open interest (confirmed bars only) ----------
+oiSym = oiSymIn == "" ? syminfo.prefix + ":" + syminfo.ticker + "_OI" : oiSymIn
+oi    = request.security(oiSym, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+// ---------- liquidation map storage ----------
+var float[] zPx   = array.new_float()
+var float[] zUsd  = array.new_float()
+var int[]   zSide = array.new_int()          // 1 = long liq (below), -1 = short liq (above)
+var float   step  = na
+if na(step)
+    step := close * binPct / 100
+
+addZone(side, px, usd) =>
+    k = math.round(px / step) * step
+    found = false
+    n = array.size(zPx)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(zSide, i) == side and array.get(zPx, i) == k
+                array.set(zUsd, i, array.get(zUsd, i) + usd)
+                found := true
+                break
+    if not found
+        array.push(zPx, k), array.push(zUsd, usd), array.push(zSide, side)
+
+var int lastBuy  = -100000
+var int lastSell = -100000
+buySig  = false
+sellSig = false
+float upUsd = 0.0
+float dnUsd = 0.0
+
+if barstate.isconfirmed and not na(oi) and not na(oi[1])
+    // 1) remove liquidated (touched) zones
+    n = array.size(zPx)
+    if n > 0
+        for i = n - 1 to 0
+            p = array.get(zPx, i)
+            s = array.get(zSide, i)
+            if (s == 1 and low <= p) or (s == -1 and high >= p)
+                array.remove(zPx, i), array.remove(zUsd, i), array.remove(zSide, i)
+    // 2) add / shrink with open-interest change
+    dOi = oi - oi[1]
+    hp  = hlc3
+    mm  = mmPct / 100
+    if dOi > 0
+        w  = 0.5 + 0.5 * (high > low ? (close - open) / (high - low) : 0.0)
+        wt = w10 + w25 + w50 + w100
+        lev = array.from(10.0, 25.0, 50.0, 100.0)
+        lw  = array.from(w10, w25, w50, w100)
+        for j = 0 to 3
+            L  = array.get(lev, j)
+            fw = array.get(lw, j) / wt
+            addZone(1,  hp * (1 - 1 / L + mm), dOi * w * fw)
+            addZone(-1, hp * (1 + 1 / L - mm), dOi * (1 - w) * fw)
+    else if dOi < 0 and oi[1] > 0
+        f = math.max(0.0, 1 + dOi / oi[1])
+        n2 = array.size(zUsd)
+        if n2 > 0
+            for i = 0 to n2 - 1
+                array.set(zUsd, i, array.get(zUsd, i) * f)
+    // keep memory bounded: drop the smallest zones
+    while array.size(zUsd) > maxZones
+        idx = array.indexof(zUsd, array.min(zUsd))
+        array.remove(zPx, idx), array.remove(zUsd, idx), array.remove(zSide, idx)
+    // 3) magnet imbalance
+    n3 = array.size(zPx)
+    if n3 > 0
+        for i = 0 to n3 - 1
+            p = array.get(zPx, i)
+            if array.get(zSide, i) == -1 and p <= close * (1 + rngPct / 100)
+                upUsd += array.get(zUsd, i)
+            if array.get(zSide, i) == 1 and p >= close * (1 - rngPct / 100)
+                dnUsd += array.get(zUsd, i)
+    if upUsd > ratio * dnUsd and upUsd > 0 and bar_index - lastBuy > coolBars
+        buySig := true
+        lastBuy := bar_index
+    if dnUsd > ratio * upUsd and dnUsd > 0 and bar_index - lastSell > coolBars
+        sellSig := true
+        lastSell := bar_index
+
+plotshape(buySig,  "BUY",  shape.labelup,   location.belowbar, color.new(#26a69a, 0), text="BUY",  textcolor=color.white, size=size.small)
+plotshape(sellSig, "SELL", shape.labeldown, location.abovebar, color.new(#ef5350, 0), text="SELL", textcolor=color.white, size=size.small)
+alertcondition(buySig,  "LiqMagnet BUY",  "Liquidation magnet BUY on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(sellSig, "LiqMagnet SELL", "Liquidation magnet SELL on {{ticker}} {{interval}} @ {{close}}")
+
+atr14 = ta.atr(14)
+// ---------- drawing (last bar only) ----------
+var box[]   drawn = array.new_box()
+var line    pLine = na
+var label   pLab  = na
+var box     pBand = na
+if barstate.islast
+    for b in drawn
+        box.delete(b)
+    array.clear(drawn)
+    n = array.size(zUsd)
+    if n > 0
+        mx = array.max(zUsd)
+        idxs = array.sort_indices(zUsd, order.descending)
+        for k = 0 to math.min(showN, n) - 1
+            i  = array.get(idxs, k)
+            p  = array.get(zPx, i)
+            u  = array.get(zUsd, i)
+            tr = int(92 - 62 * u / mx)                     // bigger cluster = less transparent
+            c  = array.get(zSide, i) == 1 ? cLong : cShort
+            b  = box.new(bar_index - zoneBack, p + step / 2, bar_index + projBars, p - step / 2,
+                         border_color=color.new(c, 100), bgcolor=color.new(c, tr),
+                         text=u > mx * 0.35 ? str.format("${0,number,#.#}M {1}", u / 1e6, array.get(zSide, i) == 1 ? "long liq" : "short liq") : "",
+                         text_color=color.new(c, 20), text_size=size.tiny, text_halign=text.align_right)
+            array.push(drawn, b)
+    // projection toward the magnet
+    line.delete(pLine), label.delete(pLab), box.delete(pBand)
+    if showProj and n > 0
+        float tgt = na
+        float best = 0.0
+        goUp = upUsd >= dnUsd
+        for i = 0 to n - 1
+            p = array.get(zPx, i)
+            s = array.get(zSide, i)
+            u = array.get(zUsd, i)
+            inRange = math.abs(p - close) / close <= rngPct / 100
+            if inRange and ((goUp and s == -1) or (not goUp and s == 1)) and u > best
+                best := u
+                tgt := p
+        if not na(tgt)
+            pLine := line.new(bar_index, close, bar_index + projBars, tgt, color=color.new(color.white, 65), style=line.style_dotted, width=2)
+            pBand := box.new(bar_index, math.max(close, tgt) + atr14, bar_index + projBars, math.min(close, tgt) - atr14,
+                             border_color=color.new(color.white, 100), bgcolor=color.new(color.white, 94))
+            pLab  := label.new(bar_index + projBars, tgt, "Magnet → " + str.tostring(tgt, format.mintick),
+                               style=label.style_label_left, color=color.new(color.white, 85), textcolor=color.new(color.white, 30), size=size.small)

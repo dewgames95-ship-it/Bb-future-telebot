@@ -36,9 +36,9 @@ feePct   = input.float(0.05, "Fee per side % (taker 0.05 / maker 0.02)", step=0.
 maxLev   = input.float(20, "Max leverage allowed", group=g1)
 g2 = "Signals"
 ratio    = input.float(3.0, "Magnet strength (x more money on one side)", minval=1.2, step=0.1, group=g2)
-rngPct   = input.float(2.0, "Look ±% around price", step=0.5, group=g2)
-tpAtr    = input.float(1.5, "Target = ATR ×", step=0.1, group=g2)
-slAtr    = input.float(1.5, "Stop = ATR ×", step=0.1, group=g2)
+rngPct   = input.float(4.0, "Look ±% around price", step=0.5, group=g2)
+tpAtr    = input.float(1.0, "Target = ATR ×", step=0.1, group=g2)
+slAtr    = input.float(2.0, "Stop = ATR ×", step=0.1, group=g2)
 g3 = "Liquidation map"
 oiSymIn  = input.string("", "Open Interest symbol (blank = auto)", group=g3)
 binPct   = input.float(0.10, "Zone size %", minval=0.02, step=0.02, group=g3)

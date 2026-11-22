@@ -1,0 +1,17 @@
+Video Overview — custom instructions (paste in NotebookLM "Customize")
+
+Format: Cinematic explainer, 3:4 vertical-ish frame, 6-8 minutes.
+Language & voice: Hinglish (Hindi + English mix, Roman style), single confident MALE narrator, friendly mentor tone, simple words a 15-year-old can follow.
+Visual theme: clean WHITE background, LIGHT BLUE cards, BLUE gradient accents (like a modern fintech/SaaS ad). Rounded cards, soft shadows, phone + dashboard mockups, simple icons, smooth slide/zoom/fade animations, animated counters for numbers, bar charts for budgets.
+No trading-guru hype, no fake profits, no "guaranteed returns". Keep risk warnings visible.
+
+Structure:
+1. Hook (10s): "79% win rate, +258% ROI ek din me… sach me? Aaj asli game samjhte hain."
+2. Signal channels asli me kaise kamate hain (affiliate, VIP, bot subscription, copy trading, promotions).
+3. Screenshot breakdown: 20x leverage ROI vs real price move, SL vs TP size, cherry-picking.
+4. "$5,000 hota toh main kya karta" — budget split chart + 90-day roadmap.
+5. Promotion: Telegram Ads, paid posts, ad networks, influencers — CPM & cost-per-subscriber table (say these are estimates).
+6. Funnel math animation: $1,000 ads → subscribers → sign-ups → paid members.
+7. Telegram bot vs Web app comparison cards.
+8. Rules & trust: no guarantees, show losses, tax/legal check.
+9. Closing line: "Signal business ka asli product signal nahi, trust + community + tools hai."
